@@ -1,0 +1,61 @@
+/* ============================================================
+   聊天存档管理器 - 样式表（v1.1.2）
+   跟随酒馆主题美化：与柏宝箱等原生扩展同一套做法——
+   不使用自定义配色，全部依赖酒馆全局组件类
+   （inline-drawer / menu_button / text_pole / flex-container…）
+   与内联主题变量（--SmartThemeBlurTintColor / --SmartThemeBodyColor /
+   --SmartThemeBorderColor / --white30a）。
+   这里只保留结构必需的最小规则：展开控制、悬停反馈、省略号、滚动条。
+   不添加任何毛玻璃 / 动画 / 阴影。
+   ============================================================ */
+
+/* 文件夹展开：只切换 display */
+.cam-char-body {
+    display: none;
+}
+
+.cam-char.cam-open .cam-char-body {
+    display: flex;
+}
+
+/* 悬停反馈（与原生菜单一致的主题变量） */
+.cam-char-head:hover,
+.cam-chat:hover {
+    background: var(--white30a);
+}
+
+/* 当前存档：边框换成主题文字色 */
+.cam-chat.cam-current {
+    border-color: var(--SmartThemeBodyColor);
+}
+
+/* 省略号 */
+.cam-char-name,
+.cam-chat-preview {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* 滚动条（迷你） */
+.cam-char-body {
+    scrollbar-width: thin;
+    scrollbar-color: var(--SmartThemeBorderColor) transparent;
+}
+
+.cam-char-body::-webkit-scrollbar {
+    width: 5px;
+}
+
+.cam-char-body::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.cam-char-body::-webkit-scrollbar-thumb {
+    background: var(--SmartThemeBorderColor);
+    border-radius: 3px;
+}
+
+.cam-char-body::-webkit-scrollbar-thumb:hover {
+    background: var(--SmartThemeBodyColor);
+}
