@@ -31,6 +31,14 @@ const counts = {};        // avatar -> 存档数量
 const chatsCache = {};    // avatar -> 完整存档列表（缓存）
 const expanded = new Set(); // 当前展开的存档文件夹（avatar，仅会话内）
 
+// ========== 性能参数 ==========
+const COUNT_CONCURRENCY = 5;   // 并发拉取存档数量的上限，避免一次性请求洪水压垮本地服务
+const FETCH_TIMEOUT = 20000;   // 单个请求超时（毫秒），防止服务端卡住时面板一直转圈
+let cacheVersion = 0;          // 存档列表缓存版本：刷新时 +1，用于跳过重复渲染
+let countsPromise = null;      // 计数请求批次去重：同一时刻只跑一批
+let renderChain = Promise.resolve(); // 渲染串行化：避免并发重建互相打断
+let lastSignature = null;      // 上次渲染时的角色列表签名，用于跳过无变化的重复重建
+
 // ========== 工具函数 ==========
 
 function noteKey(avatar, fileName) {
@@ -64,17 +72,30 @@ function formatTimestampName(base) {
     return formatDateTime(base);
 }
 
-// 按最后消息时间倒序
+// 按最后消息时间倒序（时间戳只解析一次，避免比较时重复转换）
 function sortChats(list) {
-    return list.slice().sort((a, b) => toMs(b.last_mes) - toMs(a.last_mes));
+    const msByChat = new Map();
+    for (const c of list) msByChat.set(c, toMs(c && c.last_mes));
+    return list.slice().sort((a, b) => (msByChat.get(b) || 0) - (msByChat.get(a) || 0));
 }
 
 // ========== 数据获取（走酒馆原生接口） ==========
 
+// 带超时的 fetch：避免单个请求挂起导致整个面板一直转圈
+async function fetchWithTimeout(url, options) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT);
+    try {
+        return await fetch(url, { ...options, signal: ctrl.signal });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 // 数量用 simple 模式：只读目录，不解析文件内容，非常轻量
 async function fetchSimpleCount(avatar) {
     try {
-        const res = await fetch('/api/characters/chats', {
+        const res = await fetchWithTimeout('/api/characters/chats', {
             method: 'POST',
             headers: getRequestHeaders(),
             body: JSON.stringify({ avatar_url: avatar, simple: true }),
@@ -84,7 +105,11 @@ async function fetchSimpleCount(avatar) {
         if (data && data.error === true) return 0;
         return Array.isArray(data) ? data.length : 0;
     } catch (e) {
-        console.warn(`[${MODULE_NAME}] 获取角色存档数量失败:`, e);
+        if (e && e.name === 'AbortError') {
+            console.warn(`[${MODULE_NAME}] 获取角色存档数量超时(${FETCH_TIMEOUT}ms):`, avatar);
+        } else {
+            console.warn(`[${MODULE_NAME}] 获取角色存档数量失败:`, e);
+        }
         return 0;
     }
 }
@@ -92,7 +117,7 @@ async function fetchSimpleCount(avatar) {
 // 完整信息：file_name / chat_items / file_size / mes / last_mes
 async function fetchCharacterChats(avatar) {
     try {
-        const res = await fetch('/api/characters/chats', {
+        const res = await fetchWithTimeout('/api/characters/chats', {
             method: 'POST',
             headers: getRequestHeaders(),
             body: JSON.stringify({ avatar_url: avatar }),
@@ -102,22 +127,54 @@ async function fetchCharacterChats(avatar) {
         if (data && data.error === true) return [];
         return Array.isArray(data) ? data : [];
     } catch (e) {
-        console.warn(`[${MODULE_NAME}] 获取角色存档失败:`, e);
+        if (e && e.name === 'AbortError') {
+            console.warn(`[${MODULE_NAME}] 获取角色存档超时(${FETCH_TIMEOUT}ms):`, avatar);
+        } else {
+            console.warn(`[${MODULE_NAME}] 获取角色存档失败:`, e);
+        }
         return null;
     }
 }
 
-// 加载各角色存档数量（只补缺失的）
-async function loadCounts() {
-    const list = getContext().characters || [];
-    countsLoaded = true;
-    await Promise.all(list.map(async c => {
-        if (!c || !c.avatar) return;
-        if (counts[c.avatar] === undefined) {
-            counts[c.avatar] = await fetchSimpleCount(c.avatar);
+// 受并发上限的 map：同一时刻最多 limit 个任务在跑，避免并发请求洪水
+async function mapLimit(items, limit, fn) {
+    const results = new Array(items.length);
+    let next = 0;
+    const worker = async () => {
+        while (next < items.length) {
+            const i = next++;
+            results[i] = await fn(items[i], i);
         }
-    }));
-    await renderCharFolders();
+    };
+    const workers = [];
+    for (let w = 0; w < Math.min(limit, items.length); w++) workers.push(worker());
+    await Promise.all(workers);
+    return results;
+}
+
+// 加载各角色存档数量（只补缺失的；并发受限；重复调用复用同一批次，不重复请求）
+function loadCounts() {
+    if (countsPromise) return countsPromise;
+    countsPromise = (async () => {
+        try {
+            const list = getContext().characters || [];
+            countsLoaded = true;
+            const missing = list.filter(c => c && c.avatar && counts[c.avatar] === undefined);
+            if (missing.length > 0) {
+                await mapLimit(missing, COUNT_CONCURRENCY, async c => {
+                    counts[c.avatar] = await fetchSimpleCount(c.avatar);
+                });
+                // 有新的计数结果：必须重渲染（过滤无存档角色 + 更新徽章）
+                await renderCharFolders(true);
+            } else {
+                // 无新计数：交给签名检查决定是否需要重建
+                await renderCharFolders();
+            }
+        } catch (e) {
+            console.warn(`[${MODULE_NAME}] 加载存档数量失败:`, e);
+        }
+    })().finally(() => { countsPromise = null; });
+    return countsPromise;
 }
 
 // ========== UI 构建 ==========
@@ -192,6 +249,11 @@ async function toggleFolder(folder, avatar, chevron) {
 async function renderChatList(avatar, body) {
     let chats = chatsCache[avatar];
 
+    // 已用当前版本的缓存完整渲染过：直接复用，避免收起/展开反复重建 DOM
+    if (chats && body.dataset.cacheVer === String(cacheVersion) && body.childElementCount > 0) {
+        return;
+    }
+
     // 无论是否命中缓存都先清空容器，避免「收起再展开」时存档重复显示
     body.innerHTML = '';
 
@@ -226,6 +288,7 @@ async function renderChatList(avatar, body) {
         empty.className = 'cam-empty';
         empty.textContent = '该角色暂无聊天存档';
         body.appendChild(empty);
+        body.dataset.cacheVer = String(cacheVersion);
         return;
     }
 
@@ -233,6 +296,7 @@ async function renderChatList(avatar, body) {
     const frag = document.createDocumentFragment();
     chats.forEach(chat => frag.appendChild(buildChatRow(chat, avatar, currentChat)));
     body.appendChild(frag);
+    body.dataset.cacheVer = String(cacheVersion);
 }
 
 // 更新角色文件夹上的存档数量徽章
@@ -355,11 +419,26 @@ async function loadChat(avatar, fileName) {
     }
 }
 
-async function renderCharFolders() {
-    if (!charListEl) return;
-    charListEl.innerHTML = '';
+// 渲染串行化：CHARACTER_PAGE_LOADED 与计数完成两个来源可能并发触发，排队避免互相打断
+function renderCharFolders(force = false) {
+    const run = renderChain.then(() => renderCharFoldersImpl(force));
+    renderChain = run.catch(e => console.warn(`[${MODULE_NAME}] 渲染失败:`, e));
+    return run;
+}
 
+async function renderCharFoldersImpl(force) {
+    if (!charListEl) return;
     const list = getContext().characters || [];
+
+    // 角色列表签名：列表没变且计数已加载时跳过重建（徽章与过滤结果均为最新）
+    const sig = list.map(c => c && c.avatar).filter(Boolean).join('\u0001');
+    if (!force && countsLoaded && sig === lastSignature) {
+        updateStats();
+        return;
+    }
+    lastSignature = sig;
+
+    charListEl.innerHTML = '';
 
     if (list.length === 0) {
         const empty = document.createElement('div');
@@ -420,9 +499,12 @@ function updateCurrentBadges() {
 
 // 刷新：清空缓存并重拉数量与已展开的存档
 async function refreshAll() {
+    cacheVersion++; // 让所有已渲染的存档列表整体失效，重新拉取
     Object.keys(chatsCache).forEach(k => delete chatsCache[k]);
     Object.keys(counts).forEach(k => delete counts[k]);
     countsLoaded = true;
+    // 先等在途计数批次结束，再基于清空后的状态重新拉取，避免与在途批次交错遗漏
+    await countsPromise;
     await loadCounts();
 }
 
