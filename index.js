@@ -7,11 +7,13 @@ import {
     openCharacterChat,
     setActiveGroup,
     getRequestHeaders,
+    saveChatDebounced,
+    saveChatConditional,
 } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../../scripts/extensions.js';
 
 const MODULE_NAME = 'chat-archive-manager';
-const MODULE_VERSION = '1.2.7';
+const MODULE_VERSION = '1.3.0';
 
 // 初始化扩展设置
 if (!extension_settings[MODULE_NAME]) {
@@ -466,6 +468,36 @@ function applyAvatarToChat(avatar, customUrl) {
     console.log(`[${MODULE_NAME}] 头像应用完成：标准 ${std.length} 个，内嵌 ${emb.length} 个（ls-avatar ${lsCount} + style ${styleCount}），共替换 ${replaced} 个`, { avatar, hasCustom: !!customUrl });
 }
 
+// v1.3.0：数据层同步——把存档专属头像写入当前聊天角色消息的 force_avatar 字段。
+// 酒馆渲染角色消息头像时 force_avatar 优先于角色卡头像（updateMessageElement），
+// 且直接作为 <img> 源（dataURL 无需走 /thumbnail），因此酒馆读取渲染即新头像，
+// 并随存档 JSONL 持久化，刷新/重载不丢——不再只是前端 DOM 显示补丁。
+// 移除头像时删除 force_avatar，酒馆自动回退角色默认头像。
+// 幂等：字段值无变化时不会触发重复保存。
+function syncForceAvatarToChatData(customUrl) {
+    const chat = getContext().chat || [];
+    if (!Array.isArray(chat) || !chat.length) return 0;
+    let changed = 0;
+    for (const m of chat) {
+        if (!m || m.is_user) continue; // 用户消息不覆盖
+        if (customUrl) {
+            if (m.force_avatar !== customUrl) { m.force_avatar = customUrl; changed++; }
+        } else {
+            if (m.force_avatar) { delete m.force_avatar; changed++; }
+        }
+    }
+    if (changed) {
+        try {
+            if (typeof saveChatDebounced === 'function') saveChatDebounced();
+            else if (typeof window.saveChatDebounced === 'function') window.saveChatDebounced();
+            else if (typeof saveChatConditional === 'function') saveChatConditional();
+        } catch (e) {
+            console.warn(`[${MODULE_NAME}] 保存存档头像数据失败:`, e);
+        }
+    }
+    return changed;
+}
+
 // 聊天切换 / 页面加载后：按当前存档自动应用专属头像（无自定义头像时新 DOM 本就是默认，无需恢复）
 function applyAvatarForCurrentChat() {
     const c = currentCharacter();
@@ -477,6 +509,8 @@ function applyAvatarForCurrentChat() {
     console.log(`[${MODULE_NAME}] 检查当前存档头像`, { avatar: c.avatar, chatId: getContext().chatId, hasCustom: !!url });
     if (url) {
         applyAvatarToChat(c.avatar, url);
+        // v1.3.0：数据层同步——写入消息 force_avatar，酒馆读取渲染即新头像（幂等，值不变不重复保存）
+        syncForceAvatarToChatData(url);
         // 切换聊天时消息 DOM 可能尚未渲染完成，延迟补一次（isRoleAvatarImg 校验角色，不会误伤其他存档）
         setTimeout(() => applyAvatarToChat(c.avatar, url), 150);
     }
@@ -647,7 +681,10 @@ function buildAvatarRow(chat, avatar) {
             img.classList.remove('cam-avatar-default');
             img.title = '该存档的专属头像';
             removeBtn.style.display = '';
-            if (isCurrentChat(avatar, chat.file_name)) applyAvatarToChat(avatar, dataUrl);
+            if (isCurrentChat(avatar, chat.file_name)) {
+                applyAvatarToChat(avatar, dataUrl);
+                syncForceAvatarToChatData(dataUrl);
+            }
         });
     });
 
@@ -662,7 +699,10 @@ function buildAvatarRow(chat, avatar) {
         img.classList.add('cam-avatar-default');
         img.title = '角色默认头像（未设置专属头像）';
         removeBtn.style.display = 'none';
-        if (isCurrentChat(avatar, chat.file_name)) applyAvatarToChat(avatar, null);
+        if (isCurrentChat(avatar, chat.file_name)) {
+            applyAvatarToChat(avatar, null);
+            syncForceAvatarToChatData(null);
+        }
     });
 
     row.appendChild(img);
